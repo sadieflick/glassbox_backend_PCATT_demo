@@ -378,19 +378,21 @@ def _course_subgraph(s, course: dict, add_node, add_edge) -> str:
     )
 
 
-def _get_domain_roles(s, categories: list[str]) -> list[dict]:
+def _roles_from_courses(s, courses: list[dict]) -> list[dict]:
     """
-    Pull every WorkRole whose category is in the given list, ordered by category
-    then title. Used by Q1/Q3/Q4 to expand beyond vector top-k similarity into
-    the full domain — e.g. all Cybersecurity roles, not just the 2 closest embeds.
+    Follow Course -[:ALIGNS_TO]-> WorkRole for the given courses.
+    Course descriptions match student questions more reliably than role title
+    embeddings do, so the top-matched courses are a better expansion signal
+    than NICE category buckets.
     """
-    if not categories:
+    cids = [c["id"] for c in courses if c.get("id")]
+    if not cids:
         return []
     rows = list(s.run(
-        "MATCH (w:WorkRole) WHERE w.category IN $cats "
-        "RETURN w.id AS id, w.title AS title, w.category AS category "
-        "ORDER BY w.category, w.title",
-        cats=categories,
+        "UNWIND $cids AS cid "
+        "MATCH (c:Course {id: cid})-[:ALIGNS_TO]->(w:WorkRole) "
+        "RETURN DISTINCT w.id AS id, w.title AS title, w.category AS category",
+        cids=cids,
     ))
     return [
         {"id": r["id"], "title": r["title"] or r["id"], "category": r["category"] or ""}
@@ -432,8 +434,12 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
 
             # ── Q3: cert_bridge ───────────────────────────────────────────────
             elif template_id == "Q3" and roles:
-                cats     = list(dict.fromkeys(r.get("category","") for r in roles[:2] if r.get("category")))
-                q3_roles = (_get_domain_roles(s, cats) or roles)[:5]
+                seen_ids = {r["id"] for r in roles[:3]}
+                q3_roles = list(roles[:3])
+                for cr in _roles_from_courses(s, courses[:3]):
+                    if cr["id"] not in seen_ids and len(q3_roles) < 5:
+                        seen_ids.add(cr["id"])
+                        q3_roles.append(cr)
                 for role in q3_roles:
                     role_id = role["id"]
                     add_node(role_id, "WorkRole", role["title"],
@@ -472,9 +478,14 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
 
             # ── Q4: role_landscape ────────────────────────────────────────────
             elif template_id == "Q4" and roles:
-                cats         = list(dict.fromkeys(r.get("category","") for r in roles[:3] if r.get("category")))
-                domain_roles = (_get_domain_roles(s, cats) or roles)[:8]
-                cat_display  = ", ".join(cats) if cats else "IT/Cybersecurity"
+                seen_ids     = {r["id"] for r in roles[:3]}
+                domain_roles = list(roles[:3])
+                for cr in _roles_from_courses(s, courses[:4]):
+                    if cr["id"] not in seen_ids and len(domain_roles) < 8:
+                        seen_ids.add(cr["id"])
+                        domain_roles.append(cr)
+                cats        = list(dict.fromkeys(r.get("category", "") for r in domain_roles if r.get("category")))
+                cat_display = ", ".join(cats) if cats else "IT/Cybersecurity"
                 ctx_blocks.append(f"DOMAIN LANDSCAPE — career areas: {cat_display}\n")
                 for role in domain_roles:
                     ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
@@ -609,15 +620,12 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
 
             # ── Q1 (default): role_anchor ─────────────────────────────────────
             else:
-                # Vector-matched roles are the primary anchors; fill up to 5 with
-                # same-category roles from Neo4j to cover the full domain.
-                cats       = list(dict.fromkeys(r.get("category","") for r in roles[:2] if r.get("category")))
-                seen_ids   = {r["id"] for r in roles[:3]}
-                q1_roles   = list(roles[:3])
-                for dr in _get_domain_roles(s, cats):
-                    if dr["id"] not in seen_ids and len(q1_roles) < 5:
-                        seen_ids.add(dr["id"])
-                        q1_roles.append(dr)
+                seen_ids = {r["id"] for r in roles[:3]}
+                q1_roles = list(roles[:3])
+                for cr in _roles_from_courses(s, courses[:3]):
+                    if cr["id"] not in seen_ids and len(q1_roles) < 5:
+                        seen_ids.add(cr["id"])
+                        q1_roles.append(cr)
                 for role in q1_roles:
                     ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
 
