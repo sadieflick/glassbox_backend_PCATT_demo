@@ -50,13 +50,13 @@ DATABASE = os.getenv("NEO4J_DATABASE")
 
 CERT_CAP        = 10
 COURSE_CAP      = 14
-BROAD_ROLE_CAP  = 4   # Q7 uses all 4 role anchors
+BROAD_ROLE_CAP  = 6   # Q7 broad catalog view
 
 TEMPLATE_META = {
     "Q1": {"label": "role_anchor",    "desc": "Role-centric: courses + certs to reach this career"},
     "Q2": {"label": "course_path",    "desc": "Course-centric: where this course leads"},
     "Q3": {"label": "cert_bridge",    "desc": "Cert landscape: which certs connect roles to courses"},
-    "Q4": {"label": "role_compare",   "desc": "Side-by-side: two career paths compared"},
+    "Q4": {"label": "role_landscape",  "desc": "Domain view: all roles in the relevant career domain"},
     "Q5": {"label": "cert_prep",      "desc": "Cert-prep: PCATT courses that prepare for a specific cert"},
     "Q6": {"label": "advanced_path",  "desc": "Forward chain: what comes next after this course"},
     "Q7": {"label": "broad_domain",   "desc": "Catalog view: all courses across a whole domain"},
@@ -73,7 +73,7 @@ Templates:
 Q1 role_anchor    — user wants to reach a specific work role; needs courses + certs to get there
 Q2 course_path    — user wants to know where a specific course leads (roles, certs)
 Q3 cert_bridge    — user asks WHICH certifications are needed/recommended for a career area
-Q4 role_compare   — user is comparing two distinct career paths
+Q4 role_landscape — user is exploring or comparing career domains; show all roles in those domains
 Q5 cert_prep      — user names a specific cert and asks WHICH COURSE prepares for it
 Q6 advanced_path  — user finished or is past a specific course and wants what comes NEXT
 Q7 broad_domain   — user asks broadly what courses exist in a domain with no specific cert/role target
@@ -99,9 +99,9 @@ Q: "What careers are there in networking and what certs matter?"
 Entities: WorkRole: Network Operations Specialist (85%), WorkRole: Systems Administrator (79%)
 -> {{"template": "Q3", "reason": "Question explicitly asks about certifications across career paths."}}
 
-Q: "Should I aim for cyber defense or network operations? What's the difference?"
+Q: "Should I aim for cyber defense or network operations as a career?"
 Entities: WorkRole: Cyber Defense Analyst (88%), WorkRole: Network Operations Specialist (84%)
--> {{"template": "Q4", "reason": "User explicitly comparing two distinct career paths."}}
+-> {{"template": "Q4", "reason": "User weighing two career domains; domain landscape shows all relevant roles."}}
 
 Q: "Which course in your catalog prepares me for the Security+ exam?"
 Entities: Certification: Security+ (82%), Course: CompTIA Security+ Prep (78%)
@@ -194,9 +194,9 @@ def _query_entities(question: str) -> dict:
                 out.append(entry)
         return out
 
-    roles   = _search("nice_work_roles", "work_role_id", "WorkRole",      n=4)
-    courses = _search("pcatt_courses",   "course_id",    "Course",        n=3)
-    certs   = _search("certifications",  "cert_id",      "Certification", n=3,
+    roles   = _search("nice_work_roles", "work_role_id", "WorkRole",      n=8)
+    courses = _search("pcatt_courses",   "course_id",    "Course",        n=6)
+    certs   = _search("certifications",  "cert_id",      "Certification", n=5,
                       extra_fields=["acronym", "full_name", "has_pcatt_prep"])
     return {"roles": roles, "courses": courses, "certs": certs}
 
@@ -378,6 +378,26 @@ def _course_subgraph(s, course: dict, add_node, add_edge) -> str:
     )
 
 
+def _get_domain_roles(s, categories: list[str]) -> list[dict]:
+    """
+    Pull every WorkRole whose category is in the given list, ordered by category
+    then title. Used by Q1/Q3/Q4 to expand beyond vector top-k similarity into
+    the full domain — e.g. all Cybersecurity roles, not just the 2 closest embeds.
+    """
+    if not categories:
+        return []
+    rows = list(s.run(
+        "MATCH (w:WorkRole) WHERE w.category IN $cats "
+        "RETURN w.id AS id, w.title AS title, w.category AS category "
+        "ORDER BY w.category, w.title",
+        cats=categories,
+    ))
+    return [
+        {"id": r["id"], "title": r["title"] or r["id"], "category": r["category"] or ""}
+        for r in rows if r["id"]
+    ]
+
+
 # ─── Traversal dispatcher ─────────────────────────────────────────────────────
 
 def _traverse_graph(template_id: str, entities: dict) -> dict:
@@ -412,7 +432,9 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
 
             # ── Q3: cert_bridge ───────────────────────────────────────────────
             elif template_id == "Q3" and roles:
-                for role in roles[:2]:
+                cats     = list(dict.fromkeys(r.get("category","") for r in roles[:2] if r.get("category")))
+                q3_roles = (_get_domain_roles(s, cats) or roles)[:5]
+                for role in q3_roles:
                     role_id = role["id"]
                     add_node(role_id, "WorkRole", role["title"],
                              category=role.get("category", ""))
@@ -448,10 +470,14 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                         ("\n".join(cert_lines) or "  (none)")
                     )
 
-            # ── Q4: role_compare ──────────────────────────────────────────────
-            elif template_id == "Q4" and len(roles) >= 2:
-                for i, role in enumerate(roles[:2], start=1):
-                    ctx_blocks.append(f"PATH {i}:\n{_role_subgraph(s, role, add_node, add_edge)}")
+            # ── Q4: role_landscape ────────────────────────────────────────────
+            elif template_id == "Q4" and roles:
+                cats         = list(dict.fromkeys(r.get("category","") for r in roles[:3] if r.get("category")))
+                domain_roles = (_get_domain_roles(s, cats) or roles)[:8]
+                cat_display  = ", ".join(cats) if cats else "IT/Cybersecurity"
+                ctx_blocks.append(f"DOMAIN LANDSCAPE — career areas: {cat_display}\n")
+                for role in domain_roles:
+                    ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
 
             # ── Q5: cert_prep ─────────────────────────────────────────────────
             elif template_id == "Q5" and certs:
@@ -576,14 +602,23 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
 
             # ── Q8: course_compare ────────────────────────────────────────────
             elif template_id == "Q8" and len(courses) >= 2:
-                for i, course in enumerate(courses[:2], start=1):
+                for i, course in enumerate(courses[:5], start=1):
                     ctx_blocks.append(
                         f"COURSE {i}:\n{_course_subgraph(s, course, add_node, add_edge)}"
                     )
 
             # ── Q1 (default): role_anchor ─────────────────────────────────────
             else:
-                for role in roles[:2]:
+                # Vector-matched roles are the primary anchors; fill up to 5 with
+                # same-category roles from Neo4j to cover the full domain.
+                cats       = list(dict.fromkeys(r.get("category","") for r in roles[:2] if r.get("category")))
+                seen_ids   = {r["id"] for r in roles[:3]}
+                q1_roles   = list(roles[:3])
+                for dr in _get_domain_roles(s, cats):
+                    if dr["id"] not in seen_ids and len(q1_roles) < 5:
+                        seen_ids.add(dr["id"])
+                        q1_roles.append(dr)
+                for role in q1_roles:
                     ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
 
     # Anchor entities for the path SSE event (drives active path highlighting)
@@ -594,15 +629,15 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
     elif template_id in ("Q2", "Q6", "Q8") and courses:
         anchors = [{"id": c["id"], "title": c["title"],
                     "category": "Course", "similarity": c["similarity"]}
-                   for c in courses[:2]]
-    elif template_id == "Q7":
+                   for c in courses[:5]]
+    elif template_id in ("Q4", "Q7"):
         anchors = [{"id": r["id"], "title": r["title"],
                     "category": r["category"], "similarity": r["similarity"]}
-                   for r in roles[:BROAD_ROLE_CAP]]
+                   for r in roles[:5]]
     else:
         anchors = [{"id": r["id"], "title": r["title"],
                     "category": r["category"], "similarity": r["similarity"]}
-                   for r in roles[:2]]
+                   for r in roles[:5]]
 
     return {
         "nodes":   nodes,
