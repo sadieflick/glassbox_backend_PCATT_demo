@@ -215,6 +215,7 @@ _ADV_PATH_SIGNALS   = {"what's next after", "what comes next after", "what shoul
                        "already have", "already finished", "already completed", "already passed",
                        "now that i finished", "now that i have", "now that i passed",
                        "i already have", "i finished", "i completed", "i passed",
+                       "just finished", "just completed", "just passed",
                        "what comes after", "after finishing", "after completing",
                        "if i complete", "if i finish", "once i complete", "once i finish",
                        "after i complete", "after i finish", "when i complete", "when i finish",
@@ -348,7 +349,7 @@ def _course_subgraph(s, course: dict, add_node, add_edge) -> str:
         "MATCH (c:Course {id: $cid}) "
         "OPTIONAL MATCH (c)-[:ALIGNS_TO]->(w:WorkRole) "
         "OPTIONAL MATCH (c)-[:PREPARES_FOR]->(cert:Certification) "
-        "RETURN collect(DISTINCT {id: w.id, title: w.title, category: w.category}) AS roles, "
+        "RETURN collect(DISTINCT {id: w.id, title: w.title, category: coalesce(w.category, '')}) AS roles, "
         "       collect(DISTINCT {id: cert.id, acronym: cert.acronym}) AS prep_certs",
         cid=cid,
     ))
@@ -402,7 +403,7 @@ def _roles_from_courses(s, courses: list[dict]) -> list[dict]:
 
 # ─── Traversal dispatcher ─────────────────────────────────────────────────────
 
-def _traverse_graph(template_id: str, entities: dict) -> dict:
+def _traverse_graph(template_id: str, entities: dict, question: str = "") -> dict:
     nodes: list[dict]     = []
     edges: list[dict]     = []
     seen_n: set           = set()
@@ -433,13 +434,11 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                     ctx_blocks.append(_course_subgraph(s, course, add_node, add_edge))
 
             # ── Q3: cert_bridge ───────────────────────────────────────────────
-            elif template_id == "Q3" and roles:
-                seen_ids = {r["id"] for r in roles[:3]}
-                q3_roles = list(roles[:3])
-                for cr in _roles_from_courses(s, courses[:3]):
-                    if cr["id"] not in seen_ids and len(q3_roles) < 5:
-                        seen_ids.add(cr["id"])
-                        q3_roles.append(cr)
+            # Use course-bridged roles only — role vector matches are unreliable
+            # here because OG roles have "Cybersecurity" in their titles and score
+            # highest for any generic cybersecurity query regardless of actual fit.
+            elif template_id == "Q3" and (roles or courses):
+                q3_roles = (_roles_from_courses(s, courses[:4]) or roles)[:5]
                 for role in q3_roles:
                     role_id = role["id"]
                     add_node(role_id, "WorkRole", role["title"],
@@ -491,55 +490,84 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                     ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
 
             # ── Q5: cert_prep ─────────────────────────────────────────────────
-            elif template_id == "Q5" and certs:
-                cert   = certs[0]
-                cert_id   = cert["id"]
-                acronym   = cert.get("acronym") or cert_id
-                full_name = cert.get("full_name") or acronym
+            elif template_id == "Q5":
+                # Prefer a cert name found directly in the question over vector search.
+                # Cert vector similarity is unreliable for acronyms containing "+"
+                # (tokenizers often drop it, letting CIPP/US outscore Security+ etc.)
+                q_lower   = question.lower()
+                acro_hint = next((c for c in _CERT_NAMES if c in q_lower), None)
 
-                rows = list(s.run(
-                    "MATCH (cert:Certification) "
-                    "WHERE cert.id = $cid OR cert.acronym = $acro "
-                    "WITH cert LIMIT 1 "
-                    "OPTIONAL MATCH (c:Course)-[:PREPARES_FOR]->(cert) "
-                    "OPTIONAL MATCH (w:WorkRole)-[:RECOMMENDS]->(cert) "
-                    "RETURN cert.id AS cid, cert.acronym AS cacro, cert.full_name AS cfull, "
-                    "       collect(DISTINCT {id: c.id, title: c.course_title}) AS courses, "
-                    "       collect(DISTINCT {id: w.id, title: w.title}) AS roles",
-                    cid=cert_id, acro=acronym,
-                ))
-                if rows:
-                    row       = rows[0]
-                    resolved_id = row["cid"] or cert_id
-                    add_node(resolved_id, "Certification", row["cfull"] or row["cacro"] or acronym)
+                if acro_hint:
+                    cert_id = acronym = full_name = acro_hint
+                elif certs:
+                    cert      = certs[0]
+                    cert_id   = cert["id"]
+                    acronym   = cert.get("acronym") or cert_id
+                    full_name = cert.get("full_name") or acronym
+                else:
+                    cert_id = acronym = full_name = None
 
-                    prep_courses = [c for c in row["courses"] if c.get("id")]
-                    rec_roles    = [r for r in row["roles"]   if r.get("id")]
+                if cert_id:
+                    rows = list(s.run(
+                        "MATCH (cert:Certification) "
+                        "WHERE cert.id = $cid OR cert.acronym = $acro "
+                        "   OR toLower(cert.acronym) = toLower($acro) "
+                        "WITH cert LIMIT 1 "
+                        "OPTIONAL MATCH (c:Course)-[:PREPARES_FOR]->(cert) "
+                        "OPTIONAL MATCH (w:WorkRole)-[:RECOMMENDS]->(cert) "
+                        "RETURN cert.id AS cid, cert.acronym AS cacro, cert.full_name AS cfull, "
+                        "       collect(DISTINCT {id: c.id, title: c.course_title}) AS courses, "
+                        "       collect(DISTINCT {id: w.id, title: w.title}) AS roles",
+                        cid=cert_id, acro=acronym,
+                    ))
+                    if rows:
+                        row         = rows[0]
+                        resolved_id = row["cid"] or cert_id
+                        add_node(resolved_id, "Certification", row["cfull"] or row["cacro"] or acronym)
 
-                    for c in prep_courses:
-                        add_node(c["id"], "Course", c["title"] or c["id"])
-                        add_edge(c["id"], resolved_id, "PREPARES_FOR")
-                    for r in rec_roles[:6]:
-                        add_node(r["id"], "WorkRole", r["title"])
-                        add_edge(r["id"], resolved_id, "RECOMMENDS")
+                        prep_courses = [c for c in row["courses"] if c.get("id")]
+                        rec_roles    = [r for r in row["roles"]   if r.get("id")]
 
-                    course_names = [c["title"] for c in prep_courses if c.get("title")]
-                    role_names   = [r["title"] for r in rec_roles   if r.get("title")]
+                        for c in prep_courses:
+                            add_node(c["id"], "Course", c["title"] or c["id"])
+                            add_edge(c["id"], resolved_id, "PREPARES_FOR")
+                        for r in rec_roles[:6]:
+                            add_node(r["id"], "WorkRole", r["title"])
+                            add_edge(r["id"], resolved_id, "RECOMMENDS")
 
-                    ctx_blocks.append(
-                        f"CERTIFICATION: {row['cacro'] or acronym} ({row['cfull'] or full_name})\n"
-                        "PCATT courses that prepare for this certification:\n" +
-                        ("\n".join(f"  - {n}" for n in course_names)
-                         if course_names else
-                         "  (none — no PCATT course currently prepares for this cert)") + "\n"
-                        "Work roles that recommend this certification (per NICE/C3):\n" +
-                        ("\n".join(f"  - {n}" for n in role_names[:8]) or "  (none)")
-                    )
+                        course_names = [c["title"] for c in prep_courses if c.get("title")]
+                        role_names   = [r["title"] for r in rec_roles   if r.get("title")]
+
+                        ctx_blocks.append(
+                            f"CERTIFICATION: {row['cacro'] or acronym} ({row['cfull'] or full_name})\n"
+                            "PCATT courses that prepare for this certification:\n" +
+                            ("\n".join(f"  - {n}" for n in course_names)
+                             if course_names else
+                             "  (none — no PCATT course currently prepares for this cert)") + "\n"
+                            "Work roles that recommend this certification (per NICE/C3):\n" +
+                            ("\n".join(f"  - {n}" for n in role_names[:8]) or "  (none)")
+                        )
 
             # ── Q6: advanced_path ─────────────────────────────────────────────
             elif template_id == "Q6" and courses:
-                course = courses[0]
-                cid    = course["id"]
+                # If the question names a cert (e.g. "Security+"), resolve the
+                # course that prepares for it directly — vector search is
+                # unreliable here because "+" is dropped by the tokenizer and
+                # an unrelated course often lands at courses[0].
+                q_lower   = question.lower()
+                acro_hint = next((c for c in _CERT_NAMES if c in q_lower), None)
+                course    = courses[0]
+                if acro_hint:
+                    cert_course_rows = list(s.run(
+                        "MATCH (c:Course)-[:PREPARES_FOR]->(cert:Certification) "
+                        "WHERE toLower(cert.acronym) = toLower($acro) OR cert.id = $acro "
+                        "RETURN c.id AS cid, c.course_title AS title LIMIT 1",
+                        acro=acro_hint,
+                    ))
+                    if cert_course_rows:
+                        r      = cert_course_rows[0]
+                        course = {"id": r["cid"], "title": r["title"] or r["cid"]}
+                cid = course["id"]
                 add_node(cid, "Course", course["title"])
 
                 # Step 1: what roles does this course lead to, and what cert does it cover?
@@ -560,14 +588,41 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                     covered_ids  = [i for i in r1["covered_ids"] if i]
                     covered_acro = [a for a in r1["covered_acronyms"] if a]
 
-                    for r in anchor_roles:
+                    # Only add the top 5 roles to the graph to avoid flooding
+                    for r in anchor_roles[:5]:
                         add_node(r["id"], "WorkRole", r["title"], category=r.get("category", ""))
                         add_edge(cid, r["id"], "ALIGNS_TO")
 
-                    # Step 2: per role, find next-level certs not yet covered + courses for them
-                    next_ctx_lines = []
-                    for role in anchor_roles[:2]:
-                        step2 = list(s.run(
+                    # Step 2: sibling PCATT courses — other courses aligned to the same
+                    # work roles, ranked by shared-role count. This surfaces CySA+/CASP+
+                    # regardless of cert ID rename mismatches (CASP+ → SecurityX).
+                    sibling_rows = list(s.run(
+                        "MATCH (c:Course {id: $cid})-[:ALIGNS_TO]->(w:WorkRole) "
+                        "MATCH (next:Course)-[:ALIGNS_TO]->(w) "
+                        "WHERE next.id <> $cid "
+                        "WITH next, count(DISTINCT w) AS shared "
+                        "ORDER BY shared DESC LIMIT 6 "
+                        "OPTIONAL MATCH (next)-[:PREPARES_FOR]->(cert:Certification) "
+                        "RETURN next.id AS nid, next.course_title AS ntitle, "
+                        "       collect(DISTINCT cert.acronym) AS certs, shared",
+                        cid=cid,
+                    ))
+                    sibling_lines = []
+                    for row in sibling_rows:
+                        nid = row["nid"]
+                        if not nid:
+                            continue
+                        ntitle = row["ntitle"] or nid
+                        add_node(nid, "Course", ntitle)
+                        add_edge(cid, nid, "NEXT_COURSE")
+                        certs_str = ", ".join(c for c in row["certs"] if c) or "general IT skills"
+                        sibling_lines.append(f"  - {ntitle} ({nid}) — prepares for: {certs_str}")
+
+                    # Step 3: per top role, find next-level certs not yet covered
+                    next_cert_lines = []
+                    seen_cert_ids: set = set()
+                    for role in anchor_roles[:4]:
+                        step3 = list(s.run(
                             "MATCH (w:WorkRole {id: $rid})-[:RECOMMENDS]->(cert:Certification) "
                             "WHERE NOT cert.id IN $covered "
                             "OPTIONAL MATCH (next:Course)-[:PREPARES_FOR]->(cert) "
@@ -576,10 +631,11 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                             "LIMIT $cap",
                             rid=role["id"], covered=covered_ids, cap=CERT_CAP,
                         ))
-                        for row in step2:
+                        for row in step3:
                             ncid = row["ncid"] or row["nacro"]
-                            if not ncid:
+                            if not ncid or ncid in seen_cert_ids:
                                 continue
+                            seen_cert_ids.add(ncid)
                             add_node(ncid, "Certification", row["nfull"] or row["nacro"])
                             add_edge(role["id"], ncid, "RECOMMENDS")
                             next_courses = [c for c in row["next_courses"] if c.get("id")]
@@ -587,22 +643,24 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                                 add_node(nc["id"], "Course", nc["title"] or nc["id"])
                                 add_edge(nc["id"], ncid, "PREPARES_FOR")
                             course_list = [nc["title"] for nc in next_courses if nc.get("title")]
-                            next_ctx_lines.append(
+                            next_cert_lines.append(
                                 f"  {row['nacro']} ({row['nfull'] or ''}): "
                                 + (", ".join(course_list) if course_list
                                    else "no PCATT courses prepare for this cert yet")
                             )
 
-                    role_names    = [r["title"] for r in anchor_roles if r.get("title")]
-                    covered_str   = ", ".join(covered_acro) if covered_acro else "(none)"
+                    role_names  = [r["title"] for r in anchor_roles[:5] if r.get("title")]
+                    covered_str = ", ".join(covered_acro) if covered_acro else "(none)"
 
                     ctx_blocks.append(
                         f"STARTING POINT: {course['title']} ({cid})\n"
-                        "This course aligns to work roles:\n" +
+                        "This course aligns to work roles (sample):\n" +
                         ("\n".join(f"  - {n}" for n in role_names) or "  (none)") + "\n"
                         f"Certifications already covered by this course: {covered_str}\n"
-                        "Next-level certifications to pursue (and PCATT courses that prepare each):\n" +
-                        ("\n".join(next_ctx_lines) or "  (none found in catalog)")
+                        "PCATT courses to take next (share the same work-role targets):\n" +
+                        ("\n".join(sibling_lines) or "  (none found)") + "\n"
+                        "Additional next-level certifications (per NICE recommendations):\n" +
+                        ("\n".join(next_cert_lines[:8]) or "  (none found in catalog)")
                     )
 
             # ── Q7: broad_domain ─────────────────────────────────────────────
@@ -612,8 +670,23 @@ def _traverse_graph(template_id: str, entities: dict) -> dict:
                     ctx_blocks.append(_role_subgraph(s, role, add_node, add_edge))
 
             # ── Q8: course_compare ────────────────────────────────────────────
-            elif template_id == "Q8" and len(courses) >= 2:
-                for i, course in enumerate(courses[:5], start=1):
+            elif template_id == "Q8":
+                # Resolve courses by cert names in question first — same tokenizer
+                # fix as Q5/Q6. Only fall back to vector results if < 2 found.
+                q_lower    = question.lower()
+                cert_hints = [c for c in _CERT_NAMES if c in q_lower]
+                resolved: list[dict] = []
+                for acro in cert_hints[:3]:
+                    rows = list(s.run(
+                        "MATCH (c:Course)-[:PREPARES_FOR]->(cert:Certification) "
+                        "WHERE toLower(cert.acronym) = toLower($acro) OR cert.id = $acro "
+                        "RETURN c.id AS cid, c.course_title AS title LIMIT 1",
+                        acro=acro,
+                    ))
+                    if rows and rows[0]["cid"]:
+                        resolved.append({"id": rows[0]["cid"], "title": rows[0]["title"] or rows[0]["cid"]})
+                compare_courses = resolved if len(resolved) >= 2 else courses[:5]
+                for i, course in enumerate(compare_courses, start=1):
                     ctx_blocks.append(
                         f"COURSE {i}:\n{_course_subgraph(s, course, add_node, add_edge)}"
                     )
@@ -672,7 +745,7 @@ async def _graph_rag_stream(question: str) -> AsyncGenerator[str, None]:
     yield f"data: {json.dumps({'type': 'route', 'template': template_id, 'label': TEMPLATE_META[template_id]['label'], 'reason': reason})}\n\n"
 
     # 4. Deterministic graph traversal anchored on verified entity IDs
-    graph = _traverse_graph(template_id, entities)
+    graph = _traverse_graph(template_id, entities, question=question)
 
     # 5. Emit path — frontend lights up the graph panel
     yield f"data: {json.dumps({'type': 'path', 'nodes': graph['nodes'], 'edges': graph['edges'], 'roles': graph['anchors']})}\n\n"
@@ -683,6 +756,7 @@ async def _graph_rag_stream(question: str) -> AsyncGenerator[str, None]:
         return
 
     # 6. LLM synthesis grounded strictly to the verified subgraph
+    print(f"\n{'='*60}\n[Mode C] template={template_id}  question={question!r}\n{'-'*60}\n{graph['context']}\n{'='*60}\n")
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=f"Graph data:\n\n{graph['context']}\n\nQuestion: {question}"),
